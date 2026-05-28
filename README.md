@@ -13,4 +13,6 @@ List of components:
 6. 2X 3.7V Li-on Batteries
 
 Heres a video of the robot wokring:
-https://github.com/user-attachments/assets/a73b9070-fe18-4fd9-a1ce-c560ddd5fc76
+https://github.com/user-attachments/assets/a257def0-fccf-4eac-a5d3-0701b9ae46da
+
+
