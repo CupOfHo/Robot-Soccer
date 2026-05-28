@@ -1,0 +1,499 @@
+#include "esp_camera.h"
+#include <WiFi.h>
+#include "esp_timer.h"
+#include "img_converters.h"
+#include "Arduino.h"
+#include "fb_gfx.h"
+#include "soc/soc.h"
+#include "soc/rtc_cntl_reg.h"
+#include "esp_http_server.h"
+
+// =========================================================================
+// Network Configuration
+// =========================================================================
+const char *ssid = "STEMRouter";
+const char *password = "robot1234";
+
+// =========================================================================
+// Hardware Pin Mapping (Safe for AI-Thinker ESP32-CAM)
+// =========================================================================
+// Left Motor Channel (L298N Input Lines 1 & 2)
+#define MOTOR_1_PIN_1    14   // Physical Board Label: CLK
+#define MOTOR_1_PIN_2    15   // Physical Board Label: CMD
+
+// Right Motor Channel (L298N Input Lines 3 & 4)
+#define MOTOR_2_PIN_1    2    // Physical Board Label: D2
+#define MOTOR_2_PIN_2    12   // Safe GPIO 12: Avoids GPIO 4 (Flash) & GPIO 16 (PSRAM conflict)
+
+// Accessories
+#define SERVO_PIN        13   // Physical Board Label: D3 -> Pan/Tilt or Steering Servo Signal
+#define FLASH_LED_PIN    4    // High-brightness onboard white LED
+
+// Camera Sensor Hardware Pin Map (Fixed for OmniVision OV2640 on AI-Thinker board)
+#define PWDN_GPIO_NUM     32
+#define RESET_GPIO_NUM    -1
+#define XCLK_GPIO_NUM      0
+#define SIOD_GPIO_NUM     26
+#define SIOC_GPIO_NUM     27
+#define Y9_GPIO_NUM       35
+#define Y8_GPIO_NUM       34
+#define Y7_GPIO_NUM       39
+#define Y6_GPIO_NUM       36
+#define Y5_GPIO_NUM       21
+#define Y4_GPIO_NUM       19
+#define Y3_GPIO_NUM       18
+#define Y2_GPIO_NUM        5
+#define VSYNC_GPIO_NUM    25
+#define HREF_GPIO_NUM     23
+#define PCLK_GPIO_NUM     22
+
+// Multipart MJPEG Stream Text Headers
+#define PART_BOUNDARY "123456789000000000000987654321"
+static const char *STREAM_CONTENT_TYPE = "multipart/x-mixed-replace;boundary=" PART_BOUNDARY;
+static const char *STREAM_BOUNDARY = "\r\n--" PART_BOUNDARY "\r\n";
+static const char *STREAM_PART = "Content-Type: image/jpeg\r\nContent-Length: %u\r\n\r\n";
+
+// Async Web Server Instance Containers
+httpd_handle_t camera_httpd = NULL;
+httpd_handle_t stream_httpd = NULL;
+
+// =========================================================================
+// Motor Speed & Calibration Settings (PWM range: 0 - 255)
+// =========================================================================
+const int MAX_SPEED               = 255; // Baseline driving velocity (100% duty cycle)
+const int TURN_SPEED              = 160; // Tamed spin velocity for smooth, precise turns
+const int LEFT_DRIFT_COMPENSATION = 25;  // Subtract this from the right motor to keep tracking straight
+
+// =========================================================================
+// Frontend Interface (HTML / CSS / JavaScript)
+// Embedded in Flash memory (PROGMEM) to avoid consuming precious RAM.
+// =========================================================================
+static const char PROGMEM INDEX_HTML[] = R"rawliteral(
+<!DOCTYPE html>
+<html>
+<head>
+ <title>ESP32-CAM Rover</title>
+ <meta name="viewport" content="width=device-width, initial-scale=1">
+ <style>
+   body { margin: 0; background: #1a1a1a; color: white; font-family: monospace; text-align: center; }
+   h1 { padding: 20px; color: #00ff88; }
+   canvas { max-width: 100%; border: 2px solid #00ff88; margin: 10px; }
+   p { color: #aaa; }
+   table { margin-left: auto; margin-right: auto; }
+   td { padding: 8px; }
+   .button {
+     background-color: #2f4468;
+     border: none;
+     color: white;
+     padding: 15px 30px;
+     text-align: center;
+     text-decoration: none;
+     display: inline-block;
+     font-size: 18px;
+     margin: 6px 3px;
+     cursor: pointer;
+     font-weight: bold;
+     border-radius: 5px;
+     -webkit-touch-callout: none;
+     -webkit-user-select: none;
+     user-select: none;
+   }
+   .button:active { background-color: #00ff88; color: black; }
+   .active-key { background-color: #00ff88 !important; color: black !important; }
+ </style>
+</head>
+<body>
+ <h1>ESP32-CAM Live Rover Control</h1>
+ <p id="status">Connecting...</p>
+   <p>Drive: <b>WASD</b> | Servo: Hold <b>K</b> | Flash: Hold <b>SPACEBAR</b></p>
+ <canvas id="canvas"></canvas>
+
+ <table>
+   <tr>
+     <td colspan="3" align="center">
+       <button id="btn-forward" class="button" onmousedown="sendCommand('forward');" ontouchstart="sendCommand('forward');" onmouseup="sendCommand('stop');" ontouchend="sendCommand('stop');">Forward (W)</button>
+     </td>
+   </tr>
+   <tr>
+     <td align="center">
+       <button id="btn-left" class="button" onmousedown="sendCommand('left');" ontouchstart="sendCommand('left');" onmouseup="sendCommand('stop');" ontouchend="sendCommand('stop');">Left (A)</button>
+     </td>
+     <td align="center">
+       <button id="btn-servo" class="button" onmousedown="sendCommand('servo90');" onmouseup="sendCommand('servo0');" ontouchstart="sendCommand('servo90');" ontouchend="sendCommand('servo0');">Servo (K)</button>
+     </td>
+     <td align="center">
+       <button id="btn-right" class="button" onmousedown="sendCommand('right');" ontouchstart="sendCommand('right');" onmouseup="sendCommand('stop');" ontouchend="sendCommand('stop');">Right (D)</button>
+     </td>
+   </tr>
+   <tr>
+     <td align="center">
+       <button id="btn-flash" class="button" onmousedown="sendCommand('flashon');" onmouseup="sendCommand('flashoff');" ontouchstart="sendCommand('flashon');" ontouchend="sendCommand('flashoff');">Flash (Space)</button>
+     </td>
+     <td colspan="2" align="center">
+       <button id="btn-backward" class="button" onmousedown="sendCommand('backward');" ontouchstart="sendCommand('backward');" onmouseup="sendCommand('stop');" ontouchend="sendCommand('stop');">Backward (S)</button>
+     </td>
+   </tr>                   
+ </table>
+
+ <script>
+   const canvas = document.getElementById('canvas');
+   const ctx = canvas.getContext('2d');
+   const status = document.getElementById('status');
+   let fetching = false;
+   let lastKey = "";
+
+   // Animation-frame loop requesting single frame snapshots to render on canvas
+   function fetchFrame() {
+     if (fetching) return;
+     fetching = true;
+     const img = new Image();
+     img.onload = function() {
+       canvas.width = img.width;
+       canvas.height = img.height;
+       ctx.drawImage(img, 0, 0);
+       URL.revokeObjectURL(img.src);
+       status.textContent = 'Live';
+       fetching = false;
+       requestAnimationFrame(fetchFrame);
+     };
+     img.onerror = function() {
+       fetching = false;
+       status.textContent = 'Reconnecting...';
+       setTimeout(fetchFrame, 500);
+     };
+     fetch('/snapshot?t=' + Date.now())
+       .then(r => r.blob())
+       .then(blob => { img.src = URL.createObjectURL(blob); })
+       .catch(() => { fetching = false; status.textContent = 'Reconnecting...'; setTimeout(fetchFrame, 500); });
+   }
+   
+   // Asynchronous HTTP request generator routing string tokens to ESP32
+   function sendCommand(action) {
+     var xhr = new XMLHttpRequest();
+     xhr.open("GET", "/action?go=" + action, true);
+     xhr.send();
+   }
+
+   // Map Javascript event strings to endpoint API directives
+   const keyMap = {
+     'w': { action: 'forward', id: 'btn-forward' },
+     'a': { action: 'left', id: 'btn-left' },
+     's': { action: 'backward', id: 'btn-backward' },
+     'd': { action: 'right', id: 'btn-right' },
+     'k': { action: 'servo90', id: 'btn-servo' },
+     ' ': { action: 'flashon', id: 'btn-flash' }  // Spacebar mapping
+   };
+
+   // Keyboard Down Event Processing
+   document.addEventListener('keydown', function(event) {
+     // CRITICAL: Ignores natural browser OS key repeats to prevent stuttering network packets
+     if (event.repeat) return; 
+     
+     const key = event.key.toLowerCase();
+     if (keyMap[key] && lastKey !== key) {
+       lastKey = key;
+       sendCommand(keyMap[key].action);
+       document.getElementById(keyMap[key].id).classList.add('active-key');
+       
+       // Stop Spacebar from naturally scrolling page window layout down
+       if (key === ' ') event.preventDefault(); 
+     }
+   });
+
+   // Keyboard Up Release Processing
+   document.addEventListener('keyup', function(event) {
+     const key = event.key.toLowerCase();
+     if (keyMap[key] && lastKey === key) {
+       lastKey = "";
+       if (key === 'k') {
+         sendCommand('servo0'); 
+       } else if (key === ' ') {
+         sendCommand('flashoff');
+       } else {
+         sendCommand('stop');
+       }
+       document.getElementById(keyMap[key].id).classList.remove('active-key');
+     }
+   });
+   
+   fetchFrame();
+ </script>
+</body>
+</html>
+)rawliteral";
+
+// =========================================================================
+// HTTP Snapshot Request Handler (Delivers single frame JPEGs)
+// =========================================================================
+static esp_err_t snapshot_handler(httpd_req_t *req) {
+ camera_fb_t *fb = esp_camera_fb_get();
+ if (fb) { esp_camera_fb_return(fb); } // Clear stale buffer references
+ fb = esp_camera_fb_get();            // Grab fresh frame from sensor matrices
+ if (!fb) {
+   httpd_resp_send_500(req);
+   return ESP_FAIL;
+ }
+ httpd_resp_set_type(req, "image/jpeg");
+ httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
+ httpd_resp_set_hdr(req, "Cache-Control", "no-cache");
+ esp_err_t res = httpd_resp_send(req, (const char *)fb->buf, fb->len);
+ esp_camera_fb_return(fb); // Recovers and frees frame memory space back to driver
+ return res;
+}
+
+// =========================================================================
+// HTTP Stream Request Handler (Maintains infinite multipart video chunk loop)
+// =========================================================================
+static esp_err_t stream_handler(httpd_req_t *req) {
+ camera_fb_t *fb = NULL;
+ esp_err_t res = ESP_OK;
+ size_t _jpg_buf_len = 0;
+ uint8_t *_jpg_buf = NULL;
+ char part_buf[64];
+
+ res = httpd_resp_set_type(req, STREAM_CONTENT_TYPE);
+ if (res != ESP_OK) return res;
+
+ while (true) {
+   fb = esp_camera_fb_get();
+   if (!fb) {
+     res = ESP_FAIL;
+   } else if (fb->format != PIXFORMAT_JPEG) {
+     // Fallback converter logic if sensor falls out of native JPEG mode
+     bool jpeg_converted = frame2jpg(fb, 80, &_jpg_buf, &_jpg_buf_len);
+     esp_camera_fb_return(fb);
+     fb = NULL;
+     if (!jpeg_converted) res = ESP_FAIL;
+   } else {
+     _jpg_buf_len = fb->len;
+     _jpg_buf = fb->buf;
+   }
+
+   if (res == ESP_OK) {
+     size_t hlen = snprintf(part_buf, 64, STREAM_PART, _jpg_buf_len);
+     httpd_resp_send_chunk(req, STREAM_BOUNDARY, strlen(STREAM_BOUNDARY));
+     httpd_resp_send_chunk(req, part_buf, hlen);
+     httpd_resp_send_chunk(req, (const char *)_jpg_buf, _jpg_buf_len);
+   }
+
+   if (fb) {
+     esp_camera_fb_return(fb);
+     fb = NULL;
+   }
+   if (res != ESP_OK) break;
+ }
+ return res;
+}
+
+// =========================================================================
+// HTTP Web Server Root Handler (Serves control page index)
+// =========================================================================
+static esp_err_t index_handler(httpd_req_t *req) {
+ httpd_resp_set_type(req, "text/html");
+ return httpd_resp_send(req, INDEX_HTML, strlen(INDEX_HTML));
+}
+
+// =========================================================================
+// HTTP Action REST API Parser (Translates query arguments to motor/LED state)
+// =========================================================================
+static esp_err_t action_handler(httpd_req_t *req) {
+ char* buf;
+ size_t buf_len;
+ char variable[32] = {0,};
+
+ // Unpack URL length parameters
+ buf_len = httpd_req_get_url_query_len(req) + 1;
+ if (buf_len > 1) {
+   buf = (char*)malloc(buf_len);
+   if (!buf) {
+     httpd_resp_send_500(req);
+     return ESP_FAIL;
+   }
+   // Extract query string data (e.g. "go=forward")
+   if (httpd_req_get_url_query_str(req, buf, buf_len) == ESP_OK) {
+     if (httpd_query_key_value(buf, "go", variable, sizeof(variable)) != ESP_OK) {
+       free(buf);
+       httpd_resp_send_404(req);
+       return ESP_FAIL;
+     }
+   } else {
+     free(buf);
+     httpd_resp_send_404(req);
+     return ESP_FAIL;
+   }
+   free(buf);
+ } else {
+   httpd_resp_send_404(req);
+   return ESP_FAIL;
+ }
+
+ // ==========================================
+ // Actuator Decision Matrix
+ // ==========================================
+ if (!strcmp(variable, "forward")) {
+   // Right motor value modified with drift deduction to keep trajectory straight
+   analogWrite(MOTOR_1_PIN_1, 0);
+   analogWrite(MOTOR_1_PIN_2, MAX_SPEED);
+   analogWrite(MOTOR_2_PIN_1, 0);
+   analogWrite(MOTOR_2_PIN_2, MAX_SPEED - LEFT_DRIFT_COMPENSATION);
+ }
+ else if (!strcmp(variable, "backward")) {
+   analogWrite(MOTOR_1_PIN_1, MAX_SPEED);
+   analogWrite(MOTOR_1_PIN_2, 0);
+   analogWrite(MOTOR_2_PIN_1, MAX_SPEED - LEFT_DRIFT_COMPENSATION);
+   analogWrite(MOTOR_2_PIN_2, 0);
+ }
+ else if (!strcmp(variable, "left")) {
+   // Spin motors in opposing directions using the scaled-down TURN_SPEED constant
+   analogWrite(MOTOR_1_PIN_1, 0);
+   analogWrite(MOTOR_1_PIN_2, TURN_SPEED);
+   analogWrite(MOTOR_2_PIN_1, TURN_SPEED);
+   analogWrite(MOTOR_2_PIN_2, 0);
+ }
+ else if (!strcmp(variable, "right")) {
+   // Spin motors in opposing directions using the scaled-down TURN_SPEED constant
+   analogWrite(MOTOR_1_PIN_1, TURN_SPEED);
+   analogWrite(MOTOR_1_PIN_2, 0);
+   analogWrite(MOTOR_2_PIN_1, 0);
+   analogWrite(MOTOR_2_PIN_2, TURN_SPEED);
+ }
+ else if (!strcmp(variable, "stop")) {
+   // Safely ground out all driver channels to execute hard brake state
+   analogWrite(MOTOR_1_PIN_1, 0);   analogWrite(MOTOR_1_PIN_2, 0);
+   analogWrite(MOTOR_2_PIN_1, 0);   analogWrite(MOTOR_2_PIN_2, 0);
+ }
+ else if (!strcmp(variable, "servo90")) {
+   Serial.println("Servo Action: Actuating to 90 degrees");
+   analogWrite(SERVO_PIN, 19); // 19 represents approx 2.0ms high time for 90 degrees
+ }
+ else if (!strcmp(variable, "servo0")) {
+   Serial.println("Servo Reset: Returning to original position (0 degrees)");
+   analogWrite(SERVO_PIN, 13); // 13 represents approx 1.0ms high time for 0 degrees
+ }
+ else if (!strcmp(variable, "flashon")) {
+   Serial.println("Flash Status: ON via Spacebar");
+   digitalWrite(FLASH_LED_PIN, 1);
+ }
+ else if (!strcmp(variable, "flashoff")) {
+   Serial.println("Flash Status: OFF via Spacebar Release");
+   digitalWrite(FLASH_LED_PIN, 0);
+ }
+
+ httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
+ return httpd_resp_send(req, NULL, 0);
+}
+
+// =========================================================================
+// Server Initialization (Configures asynchronous dual ports)
+// =========================================================================
+void startCameraServer() {
+ httpd_config_t config = HTTPD_DEFAULT_CONFIG();
+ config.server_port = 80; // Main UI control panel port
+ if (httpd_start(&camera_httpd, &config) == ESP_OK) {
+   httpd_uri_t index_uri = { .uri = "/", .method = HTTP_GET, .handler = index_handler, .user_ctx = NULL };
+   httpd_uri_t snap_uri = { .uri = "/snapshot", .method = HTTP_GET, .handler = snapshot_handler, .user_ctx = NULL };
+   httpd_uri_t action_uri = { .uri = "/action", .method = HTTP_GET, .handler = action_handler, .user_ctx = NULL };
+   httpd_register_uri_handler(camera_httpd, &index_uri);
+   httpd_register_uri_handler(camera_httpd, &snap_uri);
+   httpd_register_uri_handler(camera_httpd, &action_uri);
+   Serial.println("HTTP server started on port 80");
+ }
+
+ config.server_port = 81; // Dedicated high-throughput video pipeline port
+ if (httpd_start(&stream_httpd, &config) == ESP_OK) {
+   httpd_uri_t stream_uri = { .uri = "/stream", .method = HTTP_GET, .handler = stream_handler, .user_ctx = NULL };
+   httpd_register_uri_handler(stream_httpd, &stream_uri);
+   Serial.println("Stream server started on port 81");
+ }
+}
+
+// =========================================================================
+// Firmware Setup (Initializes GPIO configuration parameters)
+// =========================================================================
+void setup() {
+ // Disable brown-out detector to bypass voltage drop trigger during high current camera/Wi-Fi spikes
+ WRITE_PERI_REG(RTC_CNTL_BROWN_OUT_REG, 0);
+ Serial.begin(115200);
+
+ // Setup motor controller channel pins as outputs
+ pinMode(MOTOR_1_PIN_1, OUTPUT);
+ pinMode(MOTOR_1_PIN_2, OUTPUT);
+ pinMode(MOTOR_2_PIN_1, OUTPUT);
+ pinMode(MOTOR_2_PIN_2, OUTPUT);
+
+ // Initialize Servo Pin Properties
+ pinMode(SERVO_PIN, OUTPUT);
+ analogWriteFrequency(SERVO_PIN, 50); // Set standard RC Servo PWM frequency to 50Hz
+ analogWrite(SERVO_PIN, 13);          // Move servo home to 0 degrees position
+
+ // Initialize Flash LED pin
+ pinMode(FLASH_LED_PIN, OUTPUT);
+ digitalWrite(FLASH_LED_PIN, 0);
+
+ // Force motors into hard-stop state on startup
+ analogWrite(MOTOR_1_PIN_1, 0);   analogWrite(MOTOR_1_PIN_2, 0);
+ analogWrite(MOTOR_2_PIN_1, 0);   analogWrite(MOTOR_2_PIN_2, 0);
+
+ // Setup structural interface camera configuration structural definitions
+ camera_config_t config;
+ config.ledc_channel = LEDC_CHANNEL_0;
+ config.ledc_timer = LEDC_TIMER_0;
+ config.pin_d0 = Y2_GPIO_NUM;
+ config.pin_d1 = Y3_GPIO_NUM;
+ config.pin_d2 = Y4_GPIO_NUM;
+ config.pin_d3 = Y5_GPIO_NUM;
+ config.pin_d4 = Y6_GPIO_NUM;
+ config.pin_d5 = Y7_GPIO_NUM;
+ config.pin_d6 = Y8_GPIO_NUM;
+ config.pin_d7 = Y9_GPIO_NUM;
+ config.pin_xclk = XCLK_GPIO_NUM;
+ config.pin_pclk = PCLK_GPIO_NUM;
+ config.pin_vsync = VSYNC_GPIO_NUM;
+ config.pin_href = HREF_GPIO_NUM;
+ config.pin_sscb_sda = SIOD_GPIO_NUM;
+ config.pin_sscb_scl = SIOC_GPIO_NUM;
+ config.pin_pwdn = PWDN_GPIO_NUM;
+ config.pin_reset = RESET_GPIO_NUM;
+ config.xclk_freq_hz = 20000000;
+ config.pixel_format = PIXFORMAT_JPEG;
+ config.frame_size = FRAMESIZE_QVGA;  // Resolution size constraint
+ config.jpeg_quality = 12;            // Higher compression yields higher frame rate values
+ config.fb_count = 2;                 // Dual buffer memory layout allocations
+
+ // Power on camera array module hardware
+ if (esp_camera_init(&config) != ESP_OK) { 
+   Serial.println("Camera hardware configuration initialization failed!");
+   return; 
+ }
+
+ // Fine-tune orientation geometry mapping matrices
+ sensor_t *s = esp_camera_sensor_get();
+ s->set_hmirror(s, 0); 
+ s->set_vflip(s, 1);
+
+ // Network link establishment operations
+ WiFi.begin(ssid, password);
+ WiFi.setSleep(false); // Disables Wi-Fi modem sleep timers to keep stream responses active
+ Serial.print("Connecting to WiFi");
+ 
+ while (WiFi.status() != WL_CONNECTED) { 
+   delay(500); 
+   Serial.print("."); 
+ }
+ 
+ Serial.println("\nConnected!");
+ Serial.print("IP Address: http://");
+ Serial.println(WiFi.localIP());
+
+ startCameraServer();
+ Serial.println("Camera control panel running.");
+}
+
+// =========================================================================
+// Main Loop Execution Thread
+// =========================================================================
+void loop() {
+ // Main worker code is entirely driven by background web socket server callbacks.
+ // We use a large structural loop delay block to prevent watchdog timer errors.
+ delay(10000);
+}
